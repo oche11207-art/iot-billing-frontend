@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
+import { renderHook, waitFor, act } from '@testing-library/react';
 import { useTxRetryQueue } from './useTxRetryQueue';
 import * as indexedDbCache from '@/services/indexedDbCache';
 
@@ -219,7 +219,15 @@ describe('useTxRetryQueue', () => {
   it('should clear completed transactions', async () => {
     vi.mocked(indexedDbCache.deleteCompletedTransactions).mockResolvedValue(3);
 
+    vi.useFakeTimers();
     const { result } = renderHook(() => useTxRetryQueue(10, 'test-queue'));
+
+    // Flush faked microtasks so the async getAllPendingTransactions() resolves
+    // and its setState runs inside act()
+    await act(async () => {
+      vi.runAllTimers();
+    });
+    vi.useRealTimers();
 
     const count = await result.current.clearCompleted();
 
@@ -228,7 +236,15 @@ describe('useTxRetryQueue', () => {
   });
 
   it('should remove a transaction by ID', async () => {
+    vi.useFakeTimers();
     const { result } = renderHook(() => useTxRetryQueue(10, 'test-queue'));
+
+    // Flush faked microtasks so the async getAllPendingTransactions() resolves
+    // and its setState runs inside act()
+    await act(async () => {
+      vi.runAllTimers();
+    });
+    vi.useRealTimers();
 
     await result.current.remove('tx-123');
 
