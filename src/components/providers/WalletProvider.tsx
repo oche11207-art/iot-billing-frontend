@@ -18,6 +18,27 @@ import {
 import type { WalletMetrics, AssetBalance } from '@/types';
 import { cacheDelete } from '@/services/indexedDbCache';
 
+// E2E test mock helpers — only active when window.__mockFreighter is set
+interface MockWindow extends Window {
+  __mockFreighter?: boolean;
+  __mockPublicKey?: string;
+  __mockFreighterError?: boolean;
+  __mockHardwareWallet?: boolean;
+}
+
+function isMockMode(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (window as MockWindow).__mockFreighter === true;
+}
+
+function getMockPublicKey(): string {
+  return (window as MockWindow).__mockPublicKey ?? 'GMOCKPUBLICKEY123456789012345678901234567890';
+}
+
+function shouldMockError(): boolean {
+  return (window as MockWindow).__mockFreighterError === true;
+}
+
 interface WalletContextValue {
   metrics: WalletMetrics | null;
   isConnecting: boolean;
@@ -56,62 +77,85 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const publicKeyRef = useRef<string | null>(null);
   const disconnectCallbackRef = useRef<(() => void) | null>(null);
 
+  // Shared disconnect handler — used by both real WatchWalletChanges and mock events
+  const handleWalletDisconnect = useCallback(
+    (newAddress: string | null) => {
+      const previousKey = publicKeyRef.current;
+
+      // If the address matches our current key, this isn't a disconnect
+      if (newAddress && newAddress === previousKey) return;
+
+      generationRef.current += 1;
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+      publicKeyRef.current = null;
+      setMetrics(null);
+      setError(null);
+      setIsConnecting(false);
+
+      // Immediately clear all cached data
+      queryClient.clear();
+
+      // Logout from backend if we had a session
+      if (previousKey) {
+        void (async () => {
+          try {
+            await fetch('/api/auth/logout', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ publicKey: previousKey }),
+            });
+            await cacheDelete('authSession', previousKey);
+          } catch {
+            // best-effort cleanup
+          }
+        })();
+
+        // Trigger callback for session monitor
+        disconnectCallbackRef.current?.();
+      }
+    },
+    [queryClient],
+  );
+
   // Instant wallet disconnection detection using WatchWalletChanges
   useEffect(() => {
-    const watcher = new WatchWalletChanges(1000); // Poll every 1 second for instant detection
+    // E2E mock disconnection listener — always registered, guards on isMockMode() at event time
+    const onMockChange = (e: Event) => {
+      if (!isMockMode()) return;
+      const detail = (e as CustomEvent).detail as { address: string | null } | undefined;
+      handleWalletDisconnect(detail?.address ?? null);
+    };
+    window.addEventListener('freighter-wallet-change', onMockChange);
 
-    watcher.watch((event) => {
-      // Handle wallet lock, disconnection, or account change
-      // If no address or different address, wallet was disconnected/changed
-      if (!event.address || event.address !== publicKeyRef.current) {
-        const previousKey = publicKeyRef.current;
+    // Real Freighter watcher — only created when NOT in mock mode at mount time
+    let watcher: WatchWalletChanges | null = null;
+    if (!isMockMode()) {
+      watcher = new WatchWalletChanges(1000); // Poll every 1 second for instant detection
 
-        generationRef.current += 1;
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
-        publicKeyRef.current = null;
-        setMetrics(null);
-        setError(null);
-        setIsConnecting(false);
-
-        // Immediately clear all cached data
-        queryClient.clear();
-
-        // Logout from backend if we had a session
-        if (previousKey) {
-          void (async () => {
-            try {
-              await fetch('/api/auth/logout', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ publicKey: previousKey }),
-              });
-              await cacheDelete('authSession', previousKey);
-            } catch {
-              // best-effort cleanup
-            }
-          })();
-
-          // Trigger callback for session monitor
-          disconnectCallbackRef.current?.();
+      watcher.watch((event) => {
+        // Handle wallet lock, disconnection, or account change
+        if (!event.address || event.address !== publicKeyRef.current) {
+          handleWalletDisconnect(event.address ?? null);
+        } else if (event.address && event.address !== publicKeyRef.current) {
+          // Account changed to a different address
+          generationRef.current += 1;
+          abortControllerRef.current?.abort();
+          abortControllerRef.current = null;
+          publicKeyRef.current = event.address;
+          setMetrics(null);
+          setError(null);
+          setIsConnecting(false);
+          queryClient.clear();
         }
-      } else if (event.address && event.address !== publicKeyRef.current) {
-        // Account changed to a different address
-        generationRef.current += 1;
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
-        publicKeyRef.current = event.address;
-        setMetrics(null);
-        setError(null);
-        setIsConnecting(false);
-        queryClient.clear();
-      }
-    });
+      });
+    }
 
     return () => {
-      watcher.stop();
+      window.removeEventListener('freighter-wallet-change', onMockChange);
+      watcher?.stop();
     };
-  }, [queryClient]);
+  }, [queryClient, handleWalletDisconnect]);
 
   const refreshBalances = useCallback(async (pk: string) => {
     const response = await fetch(`/api/wallet/balances?publicKey=${pk}`);
@@ -130,6 +174,24 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setError(null);
 
     try {
+      // E2E test mock path — bypass real Freighter API
+      if (isMockMode()) {
+        if (shouldMockError()) {
+          throw new Error('Mock Freighter connection error');
+        }
+
+        const publicKey = getMockPublicKey();
+        const network = 'testnet' as const;
+        const balances: AssetBalance[] = [{ asset: 'XLM', balance: '100.0000000', decimals: 7 }];
+
+        if (!controller.signal.aborted && generation === generationRef.current) {
+          publicKeyRef.current = publicKey;
+          queryClient.clear();
+          setMetrics({ publicKey, balances, network, isConnected: true });
+        }
+        return;
+      }
+
       const publicKey = await getFreighterPublicKey();
       if (controller.signal.aborted || generation !== generationRef.current) return;
 

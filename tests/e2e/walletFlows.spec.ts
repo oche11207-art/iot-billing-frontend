@@ -42,6 +42,7 @@ test.describe('Wallet Connection Flows', () => {
 
   test('should display error state on connection failure', async ({ page }) => {
     await page.evaluate(() => {
+      window.__mockFreighter = true;
       window.__mockFreighterError = true;
     });
 
